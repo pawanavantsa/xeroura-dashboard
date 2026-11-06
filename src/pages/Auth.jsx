@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState } from 'react';
 import { LuEye, LuEyeOff, LuArrowRight, LuCheck } from 'react-icons/lu';
 import { animate, EASE_OUT } from '../motion.js';
 import { findLogin, loadCatalog, projectsFor } from '../data.js';
+import { hasSupabase, supabase } from '../lib/supabase.js';
 import AuthStage from './AuthStage.jsx';
 import { Logo } from '../Logo.jsx';
 import './auth.css';
@@ -76,6 +77,16 @@ export default function Auth({ onEnter }) {
   const submit = async (e) => {
     e.preventDefault();
     if (state !== 'idle') return;
+    if (hasSupabase) {
+      const { error } = await supabase.auth.signInWithPassword({ email: f.email.trim(), password: f.password });
+      if (error) {
+        setErr(/invalid/i.test(error.message) ? 'Wrong email or password.' : error.message);
+        shake();
+        return;
+      }
+      await enter({ email: f.email.trim() });
+      return;
+    }
     const catalog = loadCatalog();
     const hit = findLogin(f.email, catalog);
     if (!hit) {

@@ -6,9 +6,11 @@
   "scripts": {
     "dev": "vite --port 5174",
     "build": "vite build",
-    "preview": "vite preview --port 4174"
+    "preview": "vite preview --port 4174",
+    "seed": "node scripts/seed.mjs"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.119.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-icons": "^5.5.0"

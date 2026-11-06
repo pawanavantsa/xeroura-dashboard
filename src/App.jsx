@@ -8,11 +8,10 @@ import {
 import { AppCtx, Avatar, Badge, Menu, Modal, Roll } from './ui.jsx';
 import { Logo } from './Logo.jsx';
 import { exit, installRipples, stagger, themeTransition, useSlidingPill } from './motion.js';
-import {
-  addPerson, addProject, clearSession, isXerouraEmail, loadCatalog, loadSession,
-  personByName, projectsFor, saveCatalog, saveSession,
-} from './data.js';
-import { loadBoard, paceOf, saveBoard } from './store.js';
+import { clearSession, isXerouraEmail, loadCatalog, loadSession, personByName, projectsFor, saveCatalog, saveSession } from './data.js';
+import { loadBoard, paceOf } from './store.js';
+import { addPersonRemote, createProjectRemote, fetchBoard, fetchCatalog, hasSupabase, persistLocalBoard, pushTask } from './api.js';
+import { supabase } from './lib/supabase.js';
 import { fmtTime } from './lib/time.js';
 import Auth from './pages/Auth.jsx';
 import Update from './pages/Update.jsx';
@@ -44,10 +43,10 @@ function applyTheme(t) {
 }
 
 function initialSession() {
+  if (hasSupabase) return undefined;
   try {
     if (new URLSearchParams(window.location.search).get('demo') === '1') {
-      const catalog = loadCatalog();
-      const s = { email: 'priya@inq.edu', projectId: projectsFor('priya@inq.edu', catalog)[0]?.id || 'inq' };
+      const s = { email: 'priya@inq.edu', projectId: 'inq' };
       saveSession(s);
       return s;
     }
@@ -56,34 +55,64 @@ function initialSession() {
 }
 
 export default function App() {
-  const [session, setSession] = useState(() => initialSession());
+  const [session, setSession] = useState(initialSession);
   const login = useCallback((s) => {
     saveSession(s);
     setSession(s);
     window.location.hash = '#/update';
   }, []);
+  useEffect(() => {
+    if (!hasSupabase) return undefined;
+    let alive = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (!alive) return;
+      const u = data.session?.user;
+      setSession(u ? { email: u.email, uid: u.id } : null);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
+      const u = s?.user;
+      setSession(u ? { email: u.email, uid: u.id } : null);
+    });
+    return () => { alive = false; sub.subscription.unsubscribe(); };
+  }, []);
+  if (session === undefined) return <div className="au" />;
   if (!session) return <Auth onEnter={login} />;
-  return <Shell session={session} onLogout={() => { clearSession(); setSession(null); window.location.hash = '#/login'; }} />;
+  return <Shell session={session} onLogout={async () => {
+    if (hasSupabase) await supabase.auth.signOut();
+    clearSession();
+    setSession(null);
+    window.location.hash = '#/login';
+  }} />;
 }
 
 function Shell({ session, onLogout }) {
-  const [catalog, setCatalogState] = useState(loadCatalog);
+  const [catalog, setCatalogState] = useState(() => (hasSupabase ? [] : loadCatalog()));
+  const [booted, setBooted] = useState(!hasSupabase);
+  useEffect(() => {
+    let alive = true;
+    fetchCatalog().then((rows) => {
+      if (!alive) return;
+      setCatalogState(rows);
+      setBooted(true);
+    }).catch(() => setBooted(true));
+    return () => { alive = false; };
+  }, [session.email]);
   const accessible = useMemo(() => projectsFor(session.email, catalog), [session.email, catalog]);
   const [projectId, setProjectIdState] = useState(() => {
-    const list = projectsFor(session.email);
-    return list.some((p) => p.id === session.projectId) ? session.projectId : list[0]?.id;
+    try { return localStorage.getItem('xdash.projectId') || session.projectId || null; } catch { return session.projectId || null; }
   });
   const project = catalog.find((p) => p.id === projectId) || accessible[0] || catalog[0];
   const people = project?.people || [];
   const staff = isXerouraEmail(session.email, catalog);
 
   const persistCatalog = useCallback((next) => {
-    saveCatalog(next);
+    if (!hasSupabase) saveCatalog(next);
     setCatalogState(next);
   }, []);
 
   const setProjectId = useCallback((id) => {
     setProjectIdState(id);
+    try { localStorage.setItem('xdash.projectId', id); } catch { /* */ }
     saveSession({ ...session, projectId: id });
   }, [session]);
 
@@ -98,25 +127,46 @@ function Shell({ session, onLogout }) {
   const navPill = useSlidingPill(navRef, 'a.active', [route.page]);
   const tz = 'Asia/Kolkata';
   const now = Date.now();
-  const [tasks, setTasks] = useState(() => loadBoard(project?.id));
-  const actor = useMemo(
-    () => people.find((p) => p.email?.toLowerCase() === String(session.email).toLowerCase()) || people[0],
-    [people, session.email],
-  );
+  const [tasks, setTasksState] = useState(() => (project && !hasSupabase ? loadBoard(project.id) : []));
+  const actor = useMemo(() => {
+    const e = String(session.email || '').toLowerCase();
+    const hit = people.find((p) => p.email?.toLowerCase() === e);
+    if (hit) return hit;
+    if (staff) return { name: e.split('@')[0] || 'Xeroura', email: session.email, side: 'xeroura', role: 'Xeroura', tone: 'teal' };
+    return people[0];
+  }, [people, session.email, staff]);
   const pace = useMemo(() => (project ? paceOf(tasks, project, now) : null), [tasks, project, now]);
   const waiting = pace?.needClient.length || 0;
 
-  const pidRef = useRef(project.id);
+  const setTasks = useCallback((updater) => {
+    setTasksState((list) => {
+      const next = typeof updater === 'function' ? updater(list) : updater;
+      if (hasSupabase && project?.id) {
+        const prev = new Map(list.map((t) => [t.id, t]));
+        next.forEach((t) => {
+          if (prev.get(t.id) !== t) pushTask(project.id, t).catch((e) => window.__xdashToast?.(e.message || 'Could not save', 'error'));
+        });
+      }
+      return next;
+    });
+  }, [project?.id]);
+
+  const pidRef = useRef(null);
   useEffect(() => {
+    if (!project) return undefined;
+    document.title = `Xeroura · ${project.name}`;
     if (pidRef.current !== project.id) {
       pidRef.current = project.id;
-      setTasks(loadBoard(project.id));
-      document.title = `Xeroura · ${project.name}`;
-      return;
+      if (hasSupabase) {
+        fetchBoard(project.id).then(setTasksState).catch(() => setTasksState([]));
+      } else {
+        setTasksState(loadBoard(project.id));
+      }
+      return undefined;
     }
-    document.title = `Xeroura · ${project.name}`;
-    saveBoard(project.id, tasks);
-  }, [project.id, project.name, session.email, tasks]);
+    if (!hasSupabase) persistLocalBoard(project.id, tasks);
+    return undefined;
+  }, [project?.id, project?.name, tasks]);
 
   useEffect(() => { installRipples(); }, []);
   useEffect(() => { applyTheme(theme); try { localStorage.setItem('xdash.theme', theme); } catch { /* */ } }, [theme]);
@@ -144,7 +194,7 @@ function Shell({ session, onLogout }) {
     const el = mainRef.current?.querySelector('.content');
     if (!el) return;
     stagger(el, '.page-head > *, .stats > *, .settings > *, .dash-grid > *, .dash-stack > *, .pace-strip, .board-col, .rep-grid > .card, .content > .card', { step: 45, max: 14, y: 16 });
-  }, [route.page, project.id]);
+  }, [route.page, project?.id]);
 
   useEffect(() => {
     const k = (e) => {
@@ -173,9 +223,9 @@ function Shell({ session, onLogout }) {
   const navigate = useCallback((p) => { window.location.hash = `#/${p}`; }, []);
   const setTheme = (t) => { applyTheme(t); flushSync(() => setThemeState(t)); };
 
-  const latestUpdate = project.updates?.[0] || null;
+  const latestUpdate = project?.updates?.[0] || null;
   const ctx = useMemo(() => ({
-    session, project, people, phases: project.phases, files: project.files || [], updates: project.updates || [],
+    session, project, people, phases: project?.phases, files: project?.files || [], updates: project?.updates || [],
     staff, theme, setTheme, navigate, toast, tz, now: () => Date.now(), openModal: setModal, route,
     tasks, setTasks, actor, pace, personByName: (n) => personByName(people, n),
     catalog, persistCatalog, setProjectId,
@@ -185,16 +235,20 @@ function Shell({ session, onLogout }) {
   const Page = pages[route.page] || Update;
   const resolvedDark = typeof document !== 'undefined' && document.documentElement.getAttribute('data-theme') === 'dark';
 
-  const createProject = (fields) => {
-    const { catalog: next, project: created } = addProject(catalog, fields);
-    persistCatalog(next);
-    setProjectId(created.id);
-    toast(`Opened ${created.name}.`);
-    setModal(null);
-    navigate('progress');
+  const createProject = async (fields) => {
+    try {
+      const { catalog: next, project: created } = await createProjectRemote(catalog, fields, session);
+      persistCatalog(next);
+      setProjectId(created.id);
+      toast(`Opened ${created.name}.`);
+      setModal(null);
+      navigate('progress');
+    } catch (e) {
+      toast(e.message || 'Could not open project', 'error');
+    }
   };
 
-  if (!project || !pace) return null;
+  if (!booted || !project || !pace) return <div className="au" />;
 
   return (
     <AppCtx.Provider value={ctx}>
@@ -334,10 +388,14 @@ function Shell({ session, onLogout }) {
       {modal?.type === 'add-person' && (
         <AddPerson
           onClose={() => setModal(null)}
-          onAdd={(person) => {
-            persistCatalog(addPerson(catalog, project.id, person));
-            toast(`Added ${person.name}.`);
-            setModal(null);
+          onAdd={async (person) => {
+            try {
+              persistCatalog(await addPersonRemote(catalog, project.id, person));
+              toast(`Added ${person.name}.`);
+              setModal(null);
+            } catch (e) {
+              toast(e.message || 'Could not add', 'error');
+            }
           }}
         />
       )}

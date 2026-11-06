@@ -111,6 +111,11 @@ function migrateLegacyInq() {
   } catch { /* */ }
 }
 
+export function seedBoard(projectId) {
+  const seed = SEED_BOARDS[projectId];
+  return seed ? seed() : [];
+}
+
 export function loadBoard(projectId) {
   if (projectId === 'inq') migrateLegacyInq();
   try {
